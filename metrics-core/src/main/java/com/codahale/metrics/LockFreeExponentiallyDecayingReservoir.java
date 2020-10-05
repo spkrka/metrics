@@ -3,12 +3,15 @@ package com.codahale.metrics;
 import com.codahale.metrics.WeightedSnapshot.WeightedSample;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.function.BiConsumer;
+import java.util.stream.Collectors;
 
 /**
  * A lock-free exponentially-decaying random reservoir of {@code long}s. Uses Cormode et al's
@@ -40,10 +43,13 @@ import java.util.function.BiConsumer;
 public final class LockFreeExponentiallyDecayingReservoir implements Reservoir {
 
     private static final double SECONDS_PER_NANO = .000_000_001D;
+
+    private static final WeightedSample DUMMY = new WeightedSample(0, 0);
+    private static final List<Double> DUMMY_KEYS = new ArrayList<>();
+
     private static final AtomicReferenceFieldUpdater<LockFreeExponentiallyDecayingReservoir, State> stateUpdater =
             AtomicReferenceFieldUpdater.newUpdater(LockFreeExponentiallyDecayingReservoir.class, State.class, "state");
 
-    private final int size;
     private final long rescaleThresholdNanos;
     private final Clock clock;
 
@@ -51,16 +57,11 @@ public final class LockFreeExponentiallyDecayingReservoir implements Reservoir {
 
     private static final class State {
 
-        private static final AtomicIntegerFieldUpdater<State> countUpdater =
-                AtomicIntegerFieldUpdater.newUpdater(State.class, "count");
-
         private final double alphaNanos;
         private final int size;
         private final long startTick;
         // Count is updated after samples are successfully added to the map.
         private final ConcurrentSkipListMap<Double, WeightedSample> values;
-
-        private volatile int count;
 
         State(
                 double alphaNanos,
@@ -72,21 +73,26 @@ public final class LockFreeExponentiallyDecayingReservoir implements Reservoir {
             this.size = size;
             this.startTick = startTick;
             this.values = values;
-            this.count = count;
+
+            final int toAdd = size - count;
+            if (DUMMY_KEYS.size() < toAdd) {
+                ensureDummyKeySize(toAdd);
+            }
+            for (int i = 0; i < toAdd; i++) {
+                values.put(DUMMY_KEYS.get(i), DUMMY);
+            }
         }
 
         private void update(long value, long timestampNanos) {
             double itemWeight = weight(timestampNanos - startTick);
             double priority = itemWeight / ThreadLocalRandom.current().nextDouble();
-            boolean mapIsFull = count >= size;
-            if (!mapIsFull || values.firstKey() < priority) {
-                addSample(priority, value, itemWeight, mapIsFull);
+            if (values.firstKey() < priority) {
+                addSample(priority, value, itemWeight);
             }
         }
 
-        private void addSample(double priority, long value, double itemWeight, boolean bypassIncrement) {
-            if (values.putIfAbsent(priority, new WeightedSample(value, itemWeight)) == null
-                    && (bypassIncrement || countUpdater.incrementAndGet(this) > size)) {
+        private void addSample(double priority, long value, double itemWeight) {
+            if (values.putIfAbsent(priority, new WeightedSample(value, itemWeight)) == null) {
                 values.pollFirstEntry();
             }
         }
@@ -134,6 +140,16 @@ public final class LockFreeExponentiallyDecayingReservoir implements Reservoir {
         }
     }
 
+    private static void ensureDummyKeySize(int wantedCapacity) {
+        synchronized (DUMMY_KEYS) {
+            int curSize = DUMMY_KEYS.size();
+            while (curSize < wantedCapacity) {
+                DUMMY_KEYS.add(-1.0 - curSize);
+                curSize++;
+            }
+        }
+    }
+
     private static final class RescalingConsumer implements BiConsumer<Double, WeightedSample> {
         private final double scalingFactor;
         private final ConcurrentSkipListMap<Double, WeightedSample> values;
@@ -147,7 +163,7 @@ public final class LockFreeExponentiallyDecayingReservoir implements Reservoir {
         @Override
         public void accept(Double priority, WeightedSample sample) {
             double newWeight = sample.weight * scalingFactor;
-            if (Double.compare(newWeight, 0) == 0) {
+            if (Double.compare(newWeight, 0) <= 0) {
                 return;
             }
             WeightedSample newSample = new WeightedSample(sample.value, newWeight);
@@ -160,7 +176,6 @@ public final class LockFreeExponentiallyDecayingReservoir implements Reservoir {
     private LockFreeExponentiallyDecayingReservoir(int size, double alpha, Duration rescaleThreshold, Clock clock) {
         // Scale alpha to nanoseconds
         double alphaNanos = alpha * SECONDS_PER_NANO;
-        this.size = size;
         this.clock = clock;
         this.rescaleThresholdNanos = rescaleThreshold.toNanos();
         this.state = new State(alphaNanos, size, clock.getTick(), 0, new ConcurrentSkipListMap<>());
@@ -168,7 +183,10 @@ public final class LockFreeExponentiallyDecayingReservoir implements Reservoir {
 
     @Override
     public int size() {
-        return Math.min(size, state.count);
+        // This is never called in practice, so it does not need to be fast
+        return (int) state.values.keySet().stream()
+                .filter(prio -> prio > 0)
+                .count();
     }
 
     @Override
@@ -202,7 +220,11 @@ public final class LockFreeExponentiallyDecayingReservoir implements Reservoir {
     @Override
     public Snapshot getSnapshot() {
         State stateSnapshot = rescaleIfNeeded(clock.getTick());
-        return new WeightedSnapshot(stateSnapshot.values.values());
+        final List<WeightedSample> samples = stateSnapshot.values.entrySet().stream()
+                .filter(e -> e.getKey() > 0)
+                .map(Map.Entry::getValue)
+                .collect(Collectors.toList());
+        return new WeightedSnapshot(samples);
     }
 
     public static Builder builder() {
